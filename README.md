@@ -301,8 +301,12 @@ Add the `env` section to your `claude_desktop_config.json`:
 {
   "mcpServers": {
     "apple-mail": {
-      "command": "/path/to/venv/bin/python3",
-      "args": ["/path/to/apple_mail_mcp.py"],
+      "command": "uv",
+       "args": [
+                "--directory",
+                "/ABSOLUTE/PATH/TO/PARENT/FOLDER/apple-mail-mcp",
+                "run",
+                "apple-mail-mcp"
       "env": {
         "USER_EMAIL_PREFERENCES": "Default to BCG account, show max 50 emails, prefer Archive and Projects folders"
       }
