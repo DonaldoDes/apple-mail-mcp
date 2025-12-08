@@ -7,3 +7,20 @@ requires-python = ">=3.13"
 dependencies = [
       "fastmcp>=0.1.0"
 ]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+
+[tool.pytest]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+
+[project.scripts]
+apple-mail-mcp = "apple_mail_mcp.main:main"
