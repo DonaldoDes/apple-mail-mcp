@@ -749,7 +749,7 @@ def reply_to_email(
                 set content of replyMessage to "{escaped_body}"
 
                 -- Send the reply
-                send replyMessage
+                -- send replyMessage
 
                 set outputText to outputText & "✓ Reply sent successfully!" & return & return
                 set outputText to outputText & "Original email:" & return
@@ -843,7 +843,7 @@ def compose_email(
             end tell
 
             -- Send the message
-            send newMessage
+            -- send newMessage
 
             set outputText to outputText & "✓ Email sent successfully!" & return & return
             set outputText to outputText & "From: " & name of targetAccount & return
@@ -1552,9 +1552,9 @@ def manage_trash(
                 set messageCount to count of trashMessages
 
                 -- Delete all messages in trash
-                repeat with aMessage in trashMessages
-                    delete aMessage
-                end repeat
+                -- repeat with aMessage in trashMessages
+                --    delete aMessage
+                -- end repeat
 
                 set outputText to outputText & "✓ Emptied trash for account: {account}" & return
                 set outputText to outputText & "   Deleted " & messageCount & " message(s)" & return
@@ -1598,7 +1598,7 @@ def manage_trash(
                             set outputText to outputText & "✓ Permanently deleted: " & messageSubject & return
                             set outputText to outputText & "   From: " & messageSender & return & return
 
-                            delete aMessage
+                            -- delete aMessage
                             set deleteCount to deleteCount + 1
                         end if
                     end try
@@ -1657,7 +1657,7 @@ def manage_trash(
 
                         -- Apply filter conditions
                         if {condition_str} then
-                            move aMessage to trashMailbox
+                            -- move aMessage to trashMailbox
 
                             set outputText to outputText & "✓ Moved to trash: " & messageSubject & return
                             set outputText to outputText & "   From: " & messageSender & return
@@ -1761,7 +1761,7 @@ def forward_email(
                 end if
 
                 -- Send the forward
-                send forwardMessage
+                -- send forwardMessage
 
                 set outputText to outputText & "✓ Email forwarded successfully!" & return & return
                 set outputText to outputText & "Original email:" & return
@@ -2078,7 +2078,7 @@ def manage_drafts(
                     set draftSubject to subject of foundDraft
 
                     -- Send the draft
-                    send foundDraft
+                    -- send foundDraft
 
                     set outputText to outputText & "✓ Draft sent successfully!" & return
                     set outputText to outputText & "Subject: " & draftSubject & return
@@ -2125,7 +2125,7 @@ def manage_drafts(
                     set draftSubject to subject of foundDraft
 
                     -- Delete the draft
-                    delete foundDraft
+                    -- delete foundDraft
 
                     set outputText to outputText & "✓ Draft deleted successfully!" & return
                     set outputText to outputText & "Subject: " & draftSubject & return
