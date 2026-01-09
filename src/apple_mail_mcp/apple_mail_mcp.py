@@ -4,18 +4,116 @@ Apple Mail MCP Server - FastMCP implementation
 Provides tools to query and interact with Apple Mail inboxes
 """
 
+import asyncio
 import subprocess
 import json
 import os
+import logging
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from mcp.server.fastmcp import FastMCP
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 # Load user preferences from environment
 USER_PREFERENCES = os.environ.get("USER_EMAIL_PREFERENCES", "")
 
 # Initialize FastMCP server
 mcp = FastMCP("Apple Mail MCP")
+
+# Global lock to serialize AppleScript executions
+# Apple Mail can only handle one operation at a time
+_applescript_lock = asyncio.Lock()
+
+# Retry configuration
+MAX_RETRIES = 3
+INITIAL_BACKOFF_SECONDS = 2
+
+
+def get_inbox_applescript_snippet(account_var: str = "anAccount") -> str:
+    """
+    Returns AppleScript code snippet for dynamic inbox discovery.
+    
+    Supports multiple inbox name variations across different mail providers:
+    - IMAP standard: "INBOX", "Inbox"
+    - Exchange/Outlook (localized): "Boîte de réception" (FR), "Posteingang" (DE), etc.
+    
+    Args:
+        account_var: The AppleScript variable name for the account (default: "anAccount")
+    
+    Returns:
+        AppleScript code that sets 'inboxMailbox' variable to the discovered inbox
+    """
+    return f'''
+                -- Dynamic inbox discovery with fallback chain
+                set inboxMailbox to missing value
+                set possibleInboxNames to {{"INBOX", "Inbox", "Boîte de réception", "Posteingang", "Bandeja de entrada", "Posta in arrivo", "Caixa de entrada", "Входящие", "受信トレイ", "收件箱"}}
+                repeat with inboxName in possibleInboxNames
+                    try
+                        set inboxMailbox to mailbox inboxName of {account_var}
+                        exit repeat
+                    end try
+                end repeat
+                if inboxMailbox is missing value then
+                    error "Could not find inbox for account " & (name of {account_var})
+                end if
+'''
+
+
+def get_inbox_applescript_snippet_for_target(account_var: str = "targetAccount") -> str:
+    """
+    Returns AppleScript code snippet for dynamic inbox discovery for a target account.
+    
+    This is a convenience wrapper that uses 'targetAccount' as the default variable name,
+    which is commonly used when accessing a specific account by name.
+    
+    Args:
+        account_var: The AppleScript variable name for the account (default: "targetAccount")
+    
+    Returns:
+        AppleScript code that sets 'inboxMailbox' variable to the discovered inbox
+    """
+    return get_inbox_applescript_snippet(account_var)
+
+
+def get_mailbox_applescript_snippet(mailbox: str, account_var: str = "targetAccount", result_var: str = "searchMailbox") -> str:
+    """
+    Returns AppleScript code snippet for mailbox discovery with INBOX fallback.
+    
+    When the mailbox is "INBOX", uses dynamic discovery to find the inbox
+    across different mail providers (Exchange, IMAP, etc.).
+    
+    Args:
+        mailbox: The mailbox name to find
+        account_var: The AppleScript variable name for the account (default: "targetAccount")
+        result_var: The AppleScript variable name for the result (default: "searchMailbox")
+    
+    Returns:
+        AppleScript code that sets the result_var to the discovered mailbox
+    """
+    if mailbox.upper() == "INBOX":
+        # Use dynamic inbox discovery for INBOX
+        return f'''
+            -- Dynamic inbox discovery with fallback chain
+            set {result_var} to missing value
+            set possibleInboxNames to {{"INBOX", "Inbox", "Boîte de réception", "Posteingang", "Bandeja de entrada", "Posta in arrivo", "Caixa de entrada", "Входящие", "受信トレイ", "收件箱"}}
+            repeat with inboxName in possibleInboxNames
+                try
+                    set {result_var} to mailbox inboxName of {account_var}
+                    exit repeat
+                end try
+            end repeat
+            if {result_var} is missing value then
+                error "Could not find inbox for account"
+            end if
+'''
+    else:
+        # For other mailboxes, try direct access
+        return f'''
+            set {result_var} to mailbox "{mailbox}" of {account_var}
+'''
+
 
 # Decorator to inject user preferences into tool docstrings
 def inject_preferences(func):
@@ -28,20 +126,75 @@ def inject_preferences(func):
     return func
 
 
-def run_applescript(script: str) -> str:
-    """Execute AppleScript and return output"""
-    try:
-        result = subprocess.run(
-            ['osascript', '-e', script],
-            capture_output=True,
-            text=True,
-            timeout=120
-        )
-        return result.stdout.strip()
-    except subprocess.TimeoutExpired:
-        raise Exception("AppleScript execution timed out")
-    except Exception as e:
-        raise Exception(f"AppleScript execution failed: {str(e)}")
+async def run_applescript(script: str) -> str:
+    """Execute AppleScript and return output with retry logic.
+    
+    Uses asyncio.to_thread() to run the blocking subprocess call
+    in a thread pool, making it non-blocking for the async event loop.
+    
+    A global lock ensures only one AppleScript runs at a time,
+    as Apple Mail cannot handle concurrent operations.
+    
+    Retry behavior:
+    - Max 3 attempts with exponential backoff (2s, 4s, 8s)
+    - Only retries on timeout errors
+    - Script errors (syntax, runtime) fail immediately
+    """
+    async with _applescript_lock:
+        last_exception = None
+        
+        for attempt in range(MAX_RETRIES):
+            try:
+                logger.debug(f"AppleScript execution attempt {attempt + 1}/{MAX_RETRIES}")
+                
+                result = await asyncio.to_thread(
+                    subprocess.run,
+                    ['osascript', '-e', script],
+                    capture_output=True,
+                    text=True,
+                    timeout=120
+                )
+                
+                # Check for AppleScript errors
+                if result.returncode != 0:
+                    error_msg = result.stderr.strip() if result.stderr else "Unknown AppleScript error"
+                    # Script errors should not be retried - they will fail every time
+                    raise Exception(f"AppleScript error (code {result.returncode}): {error_msg}")
+                
+                if attempt > 0:
+                    logger.info(f"AppleScript succeeded on attempt {attempt + 1}")
+                
+                return result.stdout.strip()
+                
+            except subprocess.TimeoutExpired as e:
+                last_exception = e
+                backoff_time = INITIAL_BACKOFF_SECONDS * (2 ** attempt)
+                logger.warning(
+                    f"AppleScript timeout on attempt {attempt + 1}/{MAX_RETRIES}. "
+                    f"Retrying in {backoff_time}s..."
+                )
+                
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(backoff_time)
+                else:
+                    raise Exception(
+                        f"AppleScript execution timed out after {MAX_RETRIES} attempts. "
+                        "Apple Mail may be unresponsive."
+                    )
+                    
+            except FileNotFoundError:
+                # This error won't be fixed by retrying
+                raise Exception("osascript not found. This tool requires macOS with AppleScript support.")
+                
+            except Exception as e:
+                if "AppleScript error" in str(e):
+                    # Script errors should not be retried
+                    raise
+                # For other unexpected errors, don't retry
+                raise Exception(f"AppleScript execution failed: {str(e)}")
+        
+        # Should not reach here, but just in case
+        raise Exception(f"AppleScript execution failed after {MAX_RETRIES} attempts: {str(last_exception)}")
 
 
 def parse_email_list(output: str) -> List[Dict[str, Any]]:
@@ -86,7 +239,7 @@ def parse_email_list(output: str) -> List[Dict[str, Any]]:
 
 @mcp.tool()
 @inject_preferences
-def list_inbox_emails(
+async def list_inbox_emails(
     account: Optional[str] = None,
     max_emails: int = 0,
     include_read: bool = True
@@ -103,6 +256,8 @@ def list_inbox_emails(
         Formatted list of emails with subject, sender, date, and read status
     """
 
+    inbox_discovery = get_inbox_applescript_snippet("anAccount")
+    
     script = f'''
     tell application "Mail"
         set outputText to "INBOX EMAILS - ALL ACCOUNTS" & return & return
@@ -113,12 +268,7 @@ def list_inbox_emails(
             set accountName to name of anAccount
 
             try
-                -- Try to get inbox (handle both "INBOX" and "Inbox")
-                try
-                    set inboxMailbox to mailbox "INBOX" of anAccount
-                on error
-                    set inboxMailbox to mailbox "Inbox" of anAccount
-                end try
+                {inbox_discovery}
                 set inboxMessages to every message of inboxMailbox
                 set messageCount to count of inboxMessages
 
@@ -174,13 +324,13 @@ def list_inbox_emails(
     end tell
     '''
 
-    result = run_applescript(script)
+    result = await run_applescript(script)
     return result
 
 
 @mcp.tool()
 @inject_preferences
-def get_email_with_content(
+async def get_email_with_content(
     account: str,
     subject_keyword: str,
     max_results: int = 5,
@@ -209,15 +359,12 @@ def get_email_with_content(
         '''
         search_location = "all mailboxes"
     else:
+        mailbox_discovery = get_mailbox_applescript_snippet(mailbox, "targetAccount", "searchMailbox")
         mailbox_script = f'''
             try
-                set searchMailbox to mailbox "{mailbox}" of targetAccount
-            on error
-                if "{mailbox}" is "INBOX" then
-                    set searchMailbox to mailbox "Inbox" of targetAccount
-                else
-                    error "Mailbox not found: {mailbox}"
-                end if
+                {mailbox_discovery}
+            on error errMsg
+                error "Mailbox not found: {mailbox}. " & errMsg
             end try
             set searchMailboxes to {{searchMailbox}}
         '''
@@ -309,13 +456,13 @@ def get_email_with_content(
     end tell
     '''
 
-    result = run_applescript(script)
+    result = await run_applescript(script)
     return result
 
 
 @mcp.tool()
 @inject_preferences
-def get_unread_count() -> Dict[str, int]:
+async def get_unread_count() -> Dict[str, int]:
     """
     Get the count of unread emails for each account.
 
@@ -323,21 +470,18 @@ def get_unread_count() -> Dict[str, int]:
         Dictionary mapping account names to unread email counts
     """
 
-    script = '''
+    inbox_discovery = get_inbox_applescript_snippet("anAccount")
+    
+    script = f'''
     tell application "Mail"
-        set resultList to {}
+        set resultList to {{}}
         set allAccounts to every account
 
         repeat with anAccount in allAccounts
             set accountName to name of anAccount
 
             try
-                -- Try to get inbox (handle both "INBOX" and "Inbox")
-                try
-                    set inboxMailbox to mailbox "INBOX" of anAccount
-                on error
-                    set inboxMailbox to mailbox "Inbox" of anAccount
-                end try
+                {inbox_discovery}
                 set unreadCount to unread count of inboxMailbox
                 set end of resultList to accountName & ":" & unreadCount
             on error
@@ -350,7 +494,7 @@ def get_unread_count() -> Dict[str, int]:
     end tell
     '''
 
-    result = run_applescript(script)
+    result = await run_applescript(script)
 
     # Parse the result
     counts = {}
@@ -367,7 +511,7 @@ def get_unread_count() -> Dict[str, int]:
 
 @mcp.tool()
 @inject_preferences
-def list_accounts() -> List[str]:
+async def list_accounts() -> List[str]:
     """
     List all available Mail accounts.
 
@@ -390,13 +534,13 @@ def list_accounts() -> List[str]:
     end tell
     '''
 
-    result = run_applescript(script)
+    result = await run_applescript(script)
     return result.split('|') if result else []
 
 
 @mcp.tool()
 @inject_preferences
-def get_recent_emails(
+async def get_recent_emails(
     account: str,
     count: int = 10,
     include_content: bool = False
@@ -434,18 +578,15 @@ def get_recent_emails(
         end try
     ''' if include_content else ''
 
+    inbox_discovery = get_inbox_applescript_snippet_for_target("targetAccount")
+    
     script = f'''
     tell application "Mail"
         set outputText to "RECENT EMAILS - {account}" & return & return
 
         try
             set targetAccount to account "{account}"
-            -- Try to get inbox (handle both "INBOX" and "Inbox")
-            try
-                set inboxMailbox to mailbox "INBOX" of targetAccount
-            on error
-                set inboxMailbox to mailbox "Inbox" of targetAccount
-            end try
+            {inbox_discovery}
             set inboxMessages to every message of inboxMailbox
 
             set currentIndex to 0
@@ -487,13 +628,13 @@ def get_recent_emails(
     end tell
     '''
 
-    result = run_applescript(script)
+    result = await run_applescript(script)
     return result
 
 
 @mcp.tool()
 @inject_preferences
-def list_mailboxes(
+async def list_mailboxes(
     account: Optional[str] = None,
     include_counts: bool = True
 ) -> str:
@@ -574,13 +715,13 @@ def list_mailboxes(
     end tell
     '''
 
-    result = run_applescript(script)
+    result = await run_applescript(script)
     return result
 
 
 @mcp.tool()
 @inject_preferences
-def move_email(
+async def move_email(
     account: str,
     subject_keyword: str,
     to_mailbox: str,
@@ -615,6 +756,8 @@ def move_email(
         # Top-level mailbox
         dest_mailbox_script = f'mailbox "{to_mailbox}" of targetAccount'
 
+    source_mailbox_discovery = get_mailbox_applescript_snippet(from_mailbox, "targetAccount", "sourceMailbox")
+    
     script = f'''
     tell application "Mail"
         set outputText to "MOVING EMAILS" & return & return
@@ -622,15 +765,11 @@ def move_email(
 
         try
             set targetAccount to account "{account}"
-            -- Try to get source mailbox (handle both "INBOX"/"Inbox" variations)
+            -- Get source mailbox with dynamic inbox discovery
             try
-                set sourceMailbox to mailbox "{from_mailbox}" of targetAccount
-            on error
-                if "{from_mailbox}" is "INBOX" then
-                    set sourceMailbox to mailbox "Inbox" of targetAccount
-                else
-                    error "Source mailbox not found"
-                end if
+                {source_mailbox_discovery}
+            on error errMsg
+                error "Source mailbox not found: {from_mailbox}. " & errMsg
             end try
 
             -- Get destination mailbox (handles nested mailboxes)
@@ -673,17 +812,18 @@ def move_email(
     end tell
     '''
 
-    result = run_applescript(script)
+    result = await run_applescript(script)
     return result
 
 
 @mcp.tool()
 @inject_preferences
-def reply_to_email(
+async def reply_to_email(
     account: str,
     subject_keyword: str,
     reply_body: str,
-    reply_to_all: bool = False
+    reply_to_all: bool = False,
+    confirm: bool = False
 ) -> str:
     """
     Reply to an email matching a subject keyword.
@@ -693,9 +833,11 @@ def reply_to_email(
         subject_keyword: Keyword to search for in email subjects
         reply_body: The body text of the reply
         reply_to_all: If True, reply to all recipients; if False, reply only to sender (default: False)
+        confirm: If False (default), shows preview without sending.
+                 If True, actually sends the reply.
 
     Returns:
-        Confirmation message with details of the reply sent
+        Confirmation message with details of the reply (preview or sent)
     """
 
     # Escape quotes in reply_body for AppleScript
@@ -707,18 +849,23 @@ def reply_to_email(
     else:
         reply_command = 'set replyMessage to reply foundMessage with opening window'
 
+    # Send command based on confirm flag
+    if confirm:
+        send_command = 'send replyMessage'
+        status_message = "✓ Reply sent successfully!"
+    else:
+        send_command = '-- send replyMessage (dry run - set confirm=True to send)'
+        status_message = "📋 PREVIEW - Reply prepared but NOT sent (set confirm=True to send)"
+
+    inbox_discovery = get_inbox_applescript_snippet_for_target("targetAccount")
+    
     script = f'''
     tell application "Mail"
         set outputText to "SENDING REPLY" & return & return
 
         try
             set targetAccount to account "{account}"
-            -- Try to get inbox (handle both "INBOX" and "Inbox")
-            try
-                set inboxMailbox to mailbox "INBOX" of targetAccount
-            on error
-                set inboxMailbox to mailbox "Inbox" of targetAccount
-            end try
+            {inbox_discovery}
             set inboxMessages to every message of inboxMailbox
             set foundMessage to missing value
 
@@ -748,10 +895,10 @@ def reply_to_email(
                 -- Set reply content
                 set content of replyMessage to "{escaped_body}"
 
-                -- Send the reply
-                -- send replyMessage
+                -- Send the reply (or not, based on confirm)
+                {send_command}
 
-                set outputText to outputText & "✓ Reply sent successfully!" & return & return
+                set outputText to outputText & "{status_message}" & return & return
                 set outputText to outputText & "Original email:" & return
                 set outputText to outputText & "  Subject: " & messageSubject & return
                 set outputText to outputText & "  From: " & messageSender & return
@@ -771,19 +918,20 @@ def reply_to_email(
     end tell
     '''
 
-    result = run_applescript(script)
+    result = await run_applescript(script)
     return result
 
 
 @mcp.tool()
 @inject_preferences
-def compose_email(
+async def compose_email(
     account: str,
     to: str,
     subject: str,
     body: str,
     cc: Optional[str] = None,
-    bcc: Optional[str] = None
+    bcc: Optional[str] = None,
+    confirm: bool = False
 ) -> str:
     """
     Compose and send a new email from a specific account.
@@ -795,9 +943,11 @@ def compose_email(
         body: Email body text
         cc: Optional CC recipients, comma-separated for multiple
         bcc: Optional BCC recipients, comma-separated for multiple
+        confirm: If False (default), shows preview without sending.
+                 If True, actually sends the email.
 
     Returns:
-        Confirmation message with details of the sent email
+        Confirmation message with details of the email (preview or sent)
     """
 
     # Escape quotes for AppleScript
@@ -822,6 +972,14 @@ def compose_email(
             make new bcc recipient at end of bcc recipients of newMessage with properties {{address:"{addr}"}}
             '''
 
+    # Send command based on confirm flag
+    if confirm:
+        send_command = 'send newMessage'
+        status_message = "✓ Email sent successfully!"
+    else:
+        send_command = '-- send newMessage (dry run - set confirm=True to send)'
+        status_message = "📋 PREVIEW - Email prepared but NOT sent (set confirm=True to send)"
+
     script = f'''
     tell application "Mail"
         set outputText to "COMPOSING EMAIL" & return & return
@@ -842,10 +1000,10 @@ def compose_email(
                 {bcc_script}
             end tell
 
-            -- Send the message
-            -- send newMessage
+            -- Send the message (or not, based on confirm)
+            {send_command}
 
-            set outputText to outputText & "✓ Email sent successfully!" & return & return
+            set outputText to outputText & "{status_message}" & return & return
             set outputText to outputText & "From: " & name of targetAccount & return
             set outputText to outputText & "To: {to}" & return
     '''
@@ -872,13 +1030,13 @@ def compose_email(
     end tell
     '''
 
-    result = run_applescript(script)
+    result = await run_applescript(script)
     return result
 
 
 @mcp.tool()
 @inject_preferences
-def list_email_attachments(
+async def list_email_attachments(
     account: str,
     subject_keyword: str,
     max_results: int = 1
@@ -895,6 +1053,8 @@ def list_email_attachments(
         List of attachments with their names and sizes
     """
 
+    inbox_discovery = get_inbox_applescript_snippet_for_target("targetAccount")
+    
     script = f'''
     tell application "Mail"
         set outputText to "ATTACHMENTS FOR: {subject_keyword}" & return & return
@@ -902,12 +1062,7 @@ def list_email_attachments(
 
         try
             set targetAccount to account "{account}"
-            -- Try to get inbox (handle both "INBOX" and "Inbox")
-            try
-                set inboxMailbox to mailbox "INBOX" of targetAccount
-            on error
-                set inboxMailbox to mailbox "Inbox" of targetAccount
-            end try
+            {inbox_discovery}
             set inboxMessages to every message of inboxMailbox
 
             repeat with aMessage in inboxMessages
@@ -964,13 +1119,13 @@ def list_email_attachments(
     end tell
     '''
 
-    result = run_applescript(script)
+    result = await run_applescript(script)
     return result
 
 
 @mcp.tool()
 @inject_preferences
-def save_email_attachment(
+async def save_email_attachment(
     account: str,
     subject_keyword: str,
     attachment_name: str,
@@ -989,18 +1144,15 @@ def save_email_attachment(
         Confirmation message with save location
     """
 
+    inbox_discovery = get_inbox_applescript_snippet_for_target("targetAccount")
+    
     script = f'''
     tell application "Mail"
         set outputText to ""
 
         try
             set targetAccount to account "{account}"
-            -- Try to get inbox (handle both "INBOX" and "Inbox")
-            try
-                set inboxMailbox to mailbox "INBOX" of targetAccount
-            on error
-                set inboxMailbox to mailbox "Inbox" of targetAccount
-            end try
+            {inbox_discovery}
             set inboxMessages to every message of inboxMailbox
             set foundAttachment to false
 
@@ -1048,13 +1200,13 @@ def save_email_attachment(
     end tell
     '''
 
-    result = run_applescript(script)
+    result = await run_applescript(script)
     return result
 
 
 @mcp.tool()
 @inject_preferences
-def get_inbox_overview() -> str:
+async def get_inbox_overview() -> str:
     """
     Get a comprehensive overview of your email inbox status across all accounts.
 
@@ -1068,7 +1220,9 @@ def get_inbox_overview() -> str:
     to suggest relevant actions based on the current state.
     """
 
-    script = '''
+    inbox_discovery = get_inbox_applescript_snippet("anAccount")
+    
+    script = f'''
     tell application "Mail"
         set outputText to "╔══════════════════════════════════════════╗" & return
         set outputText to outputText & "║      EMAIL INBOX OVERVIEW                ║" & return
@@ -1084,12 +1238,7 @@ def get_inbox_overview() -> str:
             set accountName to name of anAccount
 
             try
-                -- Try to get inbox (handle both "INBOX" and "Inbox")
-                try
-                    set inboxMailbox to mailbox "INBOX" of anAccount
-                on error
-                    set inboxMailbox to mailbox "Inbox" of anAccount
-                end try
+                {inbox_discovery}
 
                 set unreadCount to unread count of inboxMailbox
                 set totalMessages to count of messages of inboxMailbox
@@ -1160,18 +1309,13 @@ def get_inbox_overview() -> str:
         set outputText to outputText & "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" & return
 
         -- Collect all recent messages from all accounts
-        set allRecentMessages to {}
+        set allRecentMessages to {{}}
 
         repeat with anAccount in allAccounts
             set accountName to name of anAccount
 
             try
-                -- Try to get inbox (handle both "INBOX" and "Inbox")
-                try
-                    set inboxMailbox to mailbox "INBOX" of anAccount
-                on error
-                    set inboxMailbox to mailbox "Inbox" of anAccount
-                end try
+                {inbox_discovery}
 
                 set inboxMessages to every message of inboxMailbox
 
@@ -1188,7 +1332,7 @@ def get_inbox_overview() -> str:
                         set messageRead to read status of aMessage
 
                         -- Create message record
-                        set messageRecord to {accountName:accountName, msgSubject:messageSubject, msgSender:messageSender, msgDate:messageDate, msgRead:messageRead}
+                        set messageRecord to {{accountName:accountName, msgSubject:messageSubject, msgSender:messageSender, msgDate:messageDate, msgRead:messageRead}}
                         set end of allRecentMessages to messageRecord
                     end try
                 end repeat
@@ -1245,13 +1389,13 @@ def get_inbox_overview() -> str:
     end tell
     '''
 
-    result = run_applescript(script)
+    result = await run_applescript(script)
     return result
 
 
 @mcp.tool()
 @inject_preferences
-def search_emails(
+async def search_emails(
     account: str,
     mailbox: str = "INBOX",
     subject_keyword: Optional[str] = None,
@@ -1334,15 +1478,12 @@ def search_emails(
             set searchMailboxes to allMailboxes
         '''
     else:
+        mailbox_discovery = get_mailbox_applescript_snippet(mailbox, "targetAccount", "searchMailbox")
         mailbox_script = f'''
             try
-                set searchMailbox to mailbox "{mailbox}" of targetAccount
-            on error
-                if "{mailbox}" is "INBOX" then
-                    set searchMailbox to mailbox "Inbox" of targetAccount
-                else
-                    error "Mailbox not found: {mailbox}"
-                end if
+                {mailbox_discovery}
+            on error errMsg
+                error "Mailbox not found: {mailbox}. " & errMsg
             end try
             set searchMailboxes to {{searchMailbox}}
         '''
@@ -1404,13 +1545,13 @@ def search_emails(
     end tell
     '''
 
-    result = run_applescript(script)
+    result = await run_applescript(script)
     return result
 
 
 @mcp.tool()
 @inject_preferences
-def update_email_status(
+async def update_email_status(
     account: str,
     action: str,
     subject_keyword: Optional[str] = None,
@@ -1458,6 +1599,8 @@ def update_email_status(
     else:
         return f"Error: Invalid action '{action}'. Use: mark_read, mark_unread, flag, unflag"
 
+    mailbox_discovery = get_mailbox_applescript_snippet(mailbox, "targetAccount", "targetMailbox")
+    
     script = f'''
     tell application "Mail"
         set outputText to "UPDATING EMAIL STATUS: {action_label}" & return & return
@@ -1465,15 +1608,11 @@ def update_email_status(
 
         try
             set targetAccount to account "{account}"
-            -- Try to get mailbox
+            -- Get mailbox with dynamic inbox discovery
             try
-                set targetMailbox to mailbox "{mailbox}" of targetAccount
-            on error
-                if "{mailbox}" is "INBOX" then
-                    set targetMailbox to mailbox "Inbox" of targetAccount
-                else
-                    error "Mailbox not found: {mailbox}"
-                end if
+                {mailbox_discovery}
+            on error errMsg
+                error "Mailbox not found: {mailbox}. " & errMsg
             end try
 
             set mailboxMessages to every message of targetMailbox
@@ -1511,19 +1650,20 @@ def update_email_status(
     end tell
     '''
 
-    result = run_applescript(script)
+    result = await run_applescript(script)
     return result
 
 
 @mcp.tool()
 @inject_preferences
-def manage_trash(
+async def manage_trash(
     account: str,
     action: str,
     subject_keyword: Optional[str] = None,
     sender: Optional[str] = None,
     mailbox: str = "INBOX",
-    max_deletes: int = 5
+    max_deletes: int = 5,
+    confirm: bool = False
 ) -> str:
     """
     Manage trash operations - delete emails or empty trash.
@@ -1535,12 +1675,28 @@ def manage_trash(
         sender: Optional sender to filter emails (not used for empty_trash)
         mailbox: Source mailbox (default: "INBOX", not used for empty_trash or delete_permanent)
         max_deletes: Maximum number of emails to delete (safety limit, default: 5)
+        confirm: Required for dangerous actions (empty_trash, delete_permanent).
+                 If False (default), shows preview without executing.
+                 If True, actually performs the deletion.
+                 Note: move_to_trash does NOT require confirm (safe, reversible action).
 
     Returns:
-        Confirmation message with details of deleted emails
+        Confirmation message with details of deleted emails (preview or executed)
     """
 
     if action == "empty_trash":
+        # empty_trash requires confirmation
+        if confirm:
+            delete_command = '''
+                repeat with aMessage in trashMessages
+                    delete aMessage
+                end repeat
+            '''
+            status_message = "✓ Emptied trash for account: {account}"
+        else:
+            delete_command = '-- deletion skipped (dry run - set confirm=True to execute)'
+            status_message = "📋 PREVIEW - Would empty trash for account: {account} (set confirm=True to execute)"
+
         script = f'''
         tell application "Mail"
             set outputText to "EMPTYING TRASH" & return & return
@@ -1551,13 +1707,11 @@ def manage_trash(
                 set trashMessages to every message of trashMailbox
                 set messageCount to count of trashMessages
 
-                -- Delete all messages in trash
-                -- repeat with aMessage in trashMessages
-                --    delete aMessage
-                -- end repeat
+                -- Delete all messages in trash (or preview)
+                {delete_command}
 
-                set outputText to outputText & "✓ Emptied trash for account: {account}" & return
-                set outputText to outputText & "   Deleted " & messageCount & " message(s)" & return
+                set outputText to outputText & "{status_message}" & return
+                set outputText to outputText & "   Messages in trash: " & messageCount & return
 
             on error errMsg
                 return "Error: " & errMsg
@@ -1567,6 +1721,7 @@ def manage_trash(
         end tell
         '''
     elif action == "delete_permanent":
+        # delete_permanent requires confirmation
         # Build search condition
         conditions = []
         if subject_keyword:
@@ -1576,9 +1731,18 @@ def manage_trash(
 
         condition_str = ' and '.join(conditions) if conditions else 'true'
 
+        if confirm:
+            delete_command = 'delete aMessage'
+            status_message = "✓ Permanently deleted"
+            header_message = "PERMANENTLY DELETING EMAILS"
+        else:
+            delete_command = '-- delete aMessage (dry run - set confirm=True to execute)'
+            status_message = "📋 Would permanently delete"
+            header_message = "PREVIEW - PERMANENT DELETION (set confirm=True to execute)"
+
         script = f'''
         tell application "Mail"
-            set outputText to "PERMANENTLY DELETING EMAILS" & return & return
+            set outputText to "{header_message}" & return & return
             set deleteCount to 0
 
             try
@@ -1595,17 +1759,17 @@ def manage_trash(
 
                         -- Apply filter conditions
                         if {condition_str} then
-                            set outputText to outputText & "✓ Permanently deleted: " & messageSubject & return
+                            set outputText to outputText & "{status_message}: " & messageSubject & return
                             set outputText to outputText & "   From: " & messageSender & return & return
 
-                            -- delete aMessage
+                            {delete_command}
                             set deleteCount to deleteCount + 1
                         end if
                     end try
                 end repeat
 
                 set outputText to outputText & "========================================" & return
-                set outputText to outputText & "TOTAL DELETED: " & deleteCount & " email(s)" & return
+                set outputText to outputText & "TOTAL: " & deleteCount & " email(s)" & return
                 set outputText to outputText & "========================================" & return
 
             on error errMsg
@@ -1615,7 +1779,7 @@ def manage_trash(
             return outputText
         end tell
         '''
-    else:  # move_to_trash
+    else:  # move_to_trash - safe action, no confirm needed
         # Build search condition
         conditions = []
         if subject_keyword:
@@ -1625,6 +1789,8 @@ def manage_trash(
 
         condition_str = ' and '.join(conditions) if conditions else 'true'
 
+        mailbox_discovery = get_mailbox_applescript_snippet(mailbox, "targetAccount", "sourceMailbox")
+        
         script = f'''
         tell application "Mail"
             set outputText to "MOVING EMAILS TO TRASH" & return & return
@@ -1632,15 +1798,11 @@ def manage_trash(
 
             try
                 set targetAccount to account "{account}"
-                -- Get source mailbox
+                -- Get source mailbox with dynamic inbox discovery
                 try
-                    set sourceMailbox to mailbox "{mailbox}" of targetAccount
-                on error
-                    if "{mailbox}" is "INBOX" then
-                        set sourceMailbox to mailbox "Inbox" of targetAccount
-                    else
-                        error "Mailbox not found: {mailbox}"
-                    end if
+                    {mailbox_discovery}
+                on error errMsg
+                    error "Mailbox not found: {mailbox}. " & errMsg
                 end try
 
                 -- Get trash mailbox
@@ -1657,7 +1819,8 @@ def manage_trash(
 
                         -- Apply filter conditions
                         if {condition_str} then
-                            -- move aMessage to trashMailbox
+                            -- Move to trash (safe, reversible action)
+                            move aMessage to trashMailbox
 
                             set outputText to outputText & "✓ Moved to trash: " & messageSubject & return
                             set outputText to outputText & "   From: " & messageSender & return
@@ -1680,18 +1843,19 @@ def manage_trash(
         end tell
         '''
 
-    result = run_applescript(script)
+    result = await run_applescript(script)
     return result
 
 
 @mcp.tool()
 @inject_preferences
-def forward_email(
+async def forward_email(
     account: str,
     subject_keyword: str,
     to: str,
     message: Optional[str] = None,
-    mailbox: str = "INBOX"
+    mailbox: str = "INBOX",
+    confirm: bool = False
 ) -> str:
     """
     Forward an email to one or more recipients.
@@ -1702,28 +1866,36 @@ def forward_email(
         to: Recipient email address(es), comma-separated for multiple
         message: Optional message to add before forwarded content
         mailbox: Mailbox to search in (default: "INBOX")
+        confirm: If False (default), shows preview without sending.
+                 If True, actually sends the forwarded email.
 
     Returns:
-        Confirmation message with details of forwarded email
+        Confirmation message with details of forwarded email (preview or sent)
     """
 
     escaped_message = message.replace('"', '\\"') if message else ""
 
+    # Send command based on confirm flag
+    if confirm:
+        send_command = 'send forwardMessage'
+        status_message = "✓ Email forwarded successfully!"
+    else:
+        send_command = '-- send forwardMessage (dry run - set confirm=True to send)'
+        status_message = "📋 PREVIEW - Forward prepared but NOT sent (set confirm=True to send)"
+
+    mailbox_discovery = get_mailbox_applescript_snippet(mailbox, "targetAccount", "targetMailbox")
+    
     script = f'''
     tell application "Mail"
         set outputText to "FORWARDING EMAIL" & return & return
 
         try
             set targetAccount to account "{account}"
-            -- Try to get mailbox
+            -- Get mailbox with dynamic inbox discovery
             try
-                set targetMailbox to mailbox "{mailbox}" of targetAccount
-            on error
-                if "{mailbox}" is "INBOX" then
-                    set targetMailbox to mailbox "Inbox" of targetAccount
-                else
-                    error "Mailbox not found: {mailbox}"
-                end if
+                {mailbox_discovery}
+            on error errMsg
+                error "Mailbox not found: {mailbox}. " & errMsg
             end try
 
             set mailboxMessages to every message of targetMailbox
@@ -1760,10 +1932,10 @@ def forward_email(
                     set content of forwardMessage to "{escaped_message}" & return & return & content of forwardMessage
                 end if
 
-                -- Send the forward
-                -- send forwardMessage
+                -- Send the forward (or not, based on confirm)
+                {send_command}
 
-                set outputText to outputText & "✓ Email forwarded successfully!" & return & return
+                set outputText to outputText & "{status_message}" & return & return
                 set outputText to outputText & "Original email:" & return
                 set outputText to outputText & "  Subject: " & messageSubject & return
                 set outputText to outputText & "  From: " & messageSender & return
@@ -1782,13 +1954,13 @@ def forward_email(
     end tell
     '''
 
-    result = run_applescript(script)
+    result = await run_applescript(script)
     return result
 
 
 @mcp.tool()
 @inject_preferences
-def get_email_thread(
+async def get_email_thread(
     account: str,
     subject_keyword: str,
     mailbox: str = "INBOX",
@@ -1813,25 +1985,22 @@ def get_email_thread(
     for prefix in thread_keywords:
         cleaned_keyword = cleaned_keyword.replace(prefix, '').strip()
 
-    mailbox_script = f'''
-        try
-            set searchMailbox to mailbox "{mailbox}" of targetAccount
-        on error
-            if "{mailbox}" is "INBOX" then
-                set searchMailbox to mailbox "Inbox" of targetAccount
-            else if "{mailbox}" is "All" then
-                set searchMailboxes to every mailbox of targetAccount
-                set useAllMailboxes to true
-            else
-                error "Mailbox not found: {mailbox}"
-            end if
-        end try
-
-        if "{mailbox}" is not "All" then
+    if mailbox == "All":
+        mailbox_script = '''
+            set searchMailboxes to every mailbox of targetAccount
+            set useAllMailboxes to true
+        '''
+    else:
+        mailbox_discovery = get_mailbox_applescript_snippet(mailbox, "targetAccount", "searchMailbox")
+        mailbox_script = f'''
+            try
+                {mailbox_discovery}
+            on error errMsg
+                error "Mailbox not found: {mailbox}. " & errMsg
+            end try
             set searchMailboxes to {{searchMailbox}}
             set useAllMailboxes to false
-        end if
-    '''
+        '''
 
     script = f'''
     tell application "Mail"
@@ -1924,13 +2093,13 @@ def get_email_thread(
     end tell
     '''
 
-    result = run_applescript(script)
+    result = await run_applescript(script)
     return result
 
 
 @mcp.tool()
 @inject_preferences
-def manage_drafts(
+async def manage_drafts(
     account: str,
     action: str,
     subject: Optional[str] = None,
@@ -1938,7 +2107,8 @@ def manage_drafts(
     body: Optional[str] = None,
     cc: Optional[str] = None,
     bcc: Optional[str] = None,
-    draft_subject: Optional[str] = None
+    draft_subject: Optional[str] = None,
+    confirm: bool = False
 ) -> str:
     """
     Manage draft emails - list, create, send, or delete drafts.
@@ -1952,9 +2122,13 @@ def manage_drafts(
         cc: Optional CC recipients for create
         bcc: Optional BCC recipients for create
         draft_subject: Subject keyword to find draft (required for send/delete)
+        confirm: Required for send and delete actions.
+                 If False (default), shows preview without executing.
+                 If True, actually sends or deletes the draft.
+                 Note: list and create do NOT require confirm.
 
     Returns:
-        Formatted output based on action
+        Formatted output based on action (preview or executed)
     """
 
     if action == "list":
@@ -2052,9 +2226,19 @@ def manage_drafts(
         if not draft_subject:
             return "Error: 'draft_subject' is required for sending drafts"
 
+        # send requires confirmation
+        if confirm:
+            send_command = 'send foundDraft'
+            status_message = "✓ Draft sent successfully!"
+            header_message = "SENDING DRAFT"
+        else:
+            send_command = '-- send foundDraft (dry run - set confirm=True to send)'
+            status_message = "📋 PREVIEW - Draft found but NOT sent (set confirm=True to send)"
+            header_message = "PREVIEW - SEND DRAFT"
+
         script = f'''
         tell application "Mail"
-            set outputText to "SENDING DRAFT" & return & return
+            set outputText to "{header_message}" & return & return
 
             try
                 set targetAccount to account "{account}"
@@ -2077,10 +2261,10 @@ def manage_drafts(
                 if foundDraft is not missing value then
                     set draftSubject to subject of foundDraft
 
-                    -- Send the draft
-                    -- send foundDraft
+                    -- Send the draft (or preview)
+                    {send_command}
 
-                    set outputText to outputText & "✓ Draft sent successfully!" & return
+                    set outputText to outputText & "{status_message}" & return
                     set outputText to outputText & "Subject: " & draftSubject & return
 
                 else
@@ -2099,9 +2283,19 @@ def manage_drafts(
         if not draft_subject:
             return "Error: 'draft_subject' is required for deleting drafts"
 
+        # delete requires confirmation
+        if confirm:
+            delete_command = 'delete foundDraft'
+            status_message = "✓ Draft deleted successfully!"
+            header_message = "DELETING DRAFT"
+        else:
+            delete_command = '-- delete foundDraft (dry run - set confirm=True to delete)'
+            status_message = "📋 PREVIEW - Draft found but NOT deleted (set confirm=True to delete)"
+            header_message = "PREVIEW - DELETE DRAFT"
+
         script = f'''
         tell application "Mail"
-            set outputText to "DELETING DRAFT" & return & return
+            set outputText to "{header_message}" & return & return
 
             try
                 set targetAccount to account "{account}"
@@ -2124,10 +2318,10 @@ def manage_drafts(
                 if foundDraft is not missing value then
                     set draftSubject to subject of foundDraft
 
-                    -- Delete the draft
-                    -- delete foundDraft
+                    -- Delete the draft (or preview)
+                    {delete_command}
 
-                    set outputText to outputText & "✓ Draft deleted successfully!" & return
+                    set outputText to outputText & "{status_message}" & return
                     set outputText to outputText & "Subject: " & draftSubject & return
 
                 else
@@ -2145,13 +2339,13 @@ def manage_drafts(
     else:
         return f"Error: Invalid action '{action}'. Use: list, create, send, delete"
 
-    result = run_applescript(script)
+    result = await run_applescript(script)
     return result
 
 
 @mcp.tool()
 @inject_preferences
-def get_statistics(
+async def get_statistics(
     account: str,
     scope: str = "account_overview",
     sender: Optional[str] = None,
@@ -2360,6 +2554,7 @@ def get_statistics(
 
     elif scope == "mailbox_breakdown":
         mailbox_param = mailbox if mailbox else "INBOX"
+        mailbox_discovery = get_mailbox_applescript_snippet(mailbox_param, "targetAccount", "targetMailbox")
 
         script = f'''
         tell application "Mail"
@@ -2370,13 +2565,9 @@ def get_statistics(
             try
                 set targetAccount to account "{account}"
                 try
-                    set targetMailbox to mailbox "{mailbox_param}" of targetAccount
-                on error
-                    if "{mailbox_param}" is "INBOX" then
-                        set targetMailbox to mailbox "Inbox" of targetAccount
-                    else
-                        error "Mailbox not found"
-                    end if
+                    {mailbox_discovery}
+                on error errMsg
+                    error "Mailbox not found: {mailbox_param}. " & errMsg
                 end try
 
                 set mailboxMessages to every message of targetMailbox
@@ -2398,13 +2589,13 @@ def get_statistics(
     else:
         return f"Error: Invalid scope '{scope}'. Use: account_overview, sender_stats, mailbox_breakdown"
 
-    result = run_applescript(script)
+    result = await run_applescript(script)
     return result
 
 
 @mcp.tool()
 @inject_preferences
-def export_emails(
+async def export_emails(
     account: str,
     scope: str,
     subject_keyword: Optional[str] = None,
@@ -2435,21 +2626,19 @@ def export_emails(
         if not subject_keyword:
             return "Error: 'subject_keyword' required for single_email scope"
 
+        mailbox_discovery = get_mailbox_applescript_snippet(mailbox, "targetAccount", "targetMailbox")
+        
         script = f'''
         tell application "Mail"
             set outputText to "EXPORTING EMAIL" & return & return
 
             try
                 set targetAccount to account "{account}"
-                -- Try to get mailbox
+                -- Get mailbox with dynamic inbox discovery
                 try
-                    set targetMailbox to mailbox "{mailbox}" of targetAccount
-                on error
-                    if "{mailbox}" is "INBOX" then
-                        set targetMailbox to mailbox "Inbox" of targetAccount
-                    else
-                        error "Mailbox not found: {mailbox}"
-                    end if
+                    {mailbox_discovery}
+                on error errMsg
+                    error "Mailbox not found: {mailbox}. " & errMsg
                 end try
 
                 set mailboxMessages to every message of targetMailbox
@@ -2525,21 +2714,19 @@ def export_emails(
         '''
 
     elif scope == "entire_mailbox":
+        mailbox_discovery = get_mailbox_applescript_snippet(mailbox, "targetAccount", "targetMailbox")
+        
         script = f'''
         tell application "Mail"
             set outputText to "EXPORTING MAILBOX" & return & return
 
             try
                 set targetAccount to account "{account}"
-                -- Try to get mailbox
+                -- Get mailbox with dynamic inbox discovery
                 try
-                    set targetMailbox to mailbox "{mailbox}" of targetAccount
-                on error
-                    if "{mailbox}" is "INBOX" then
-                        set targetMailbox to mailbox "Inbox" of targetAccount
-                    else
-                        error "Mailbox not found: {mailbox}"
-                    end if
+                    {mailbox_discovery}
+                on error errMsg
+                    error "Mailbox not found: {mailbox}. " & errMsg
                 end try
 
                 set mailboxMessages to every message of targetMailbox
@@ -2613,7 +2800,7 @@ def export_emails(
     else:
         return f"Error: Invalid scope '{scope}'. Use: single_email, entire_mailbox"
 
-    result = run_applescript(script)
+    result = await run_applescript(script)
     return result
 
 
